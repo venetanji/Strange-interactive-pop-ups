@@ -8,7 +8,12 @@ pygame.init()
 
 # 设置窗口
 WIDTH, HEIGHT = 800, 600
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+_FLAGS = pygame.SCALED | pygame.DOUBLEBUF
+try:
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), _FLAGS, vsync=1)
+except TypeError:
+    # Older pygame versions don't support the vsync kwarg
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), _FLAGS)
 pygame.display.set_caption("3D梦境生成器")
 
 # 颜色定义
@@ -22,6 +27,17 @@ COLORS = [
     (147, 112, 219), # 中紫色
     (72, 61, 139),   # 暗紫罗兰色
 ]
+
+# Reusable alpha layer: draw all translucent primitives here once per frame,
+# then blit to the screen. This avoids allocating many temporary Surfaces.
+alpha_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+
+# Reusable trail overlay (constant)
+trail_overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+trail_overlay.fill((0, 0, 0, 20))
+
+# Cache for rendered sphere sprites (keyed by radius and color)
+_sphere_sprite_cache = {}
 
 # 3D立方体类
 class DreamCube:
@@ -115,11 +131,9 @@ class DreamCube:
             avg_scale = (scale1 + scale2) / 2
             alpha = int(255 * avg_scale)
             color_with_alpha = (*self.color, alpha)
-            
-            # 绘制线条
-            line_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            pygame.draw.line(line_surface, color_with_alpha, (x1, y1), (x2, y2), 2)
-            surface.blit(line_surface, (0, 0))
+
+            # 绘制线条（直接画到带 alpha 的 layer 上）
+            pygame.draw.line(surface, color_with_alpha, (x1, y1), (x2, y2), 2)
 
 # 浮动建筑类
 class FloatingBuilding:
@@ -184,10 +198,8 @@ class FloatingBuilding:
             avg_scale = (scale1 + scale2) / 2
             alpha = int(200 * avg_scale)
             color_with_alpha = (*self.color, alpha)
-            
-            line_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            pygame.draw.line(line_surface, color_with_alpha, (x1, y1), (x2, y2), 3)
-            surface.blit(line_surface, (0, 0))
+
+            pygame.draw.line(surface, color_with_alpha, (x1, y1), (x2, y2), 3)
         
         # 绘制窗户
         window_size = max(2, int(5 * projected[0][2]))
@@ -244,19 +256,28 @@ class FloatingSphere:
         screen_x = WIDTH//2 + self.x * scale
         screen_y = HEIGHT//2 + self.y * scale
         screen_radius = int(self.radius * scale)
+
+        if screen_radius <= 0:
+            return
         
-        # 绘制球体
-        sphere_surface = pygame.Surface((screen_radius*2, screen_radius*2), pygame.SRCALPHA)
-        pygame.draw.circle(sphere_surface, (*self.color, 180), 
-                         (screen_radius, screen_radius), screen_radius)
-        
-        # 添加高光
-        highlight_pos = (screen_radius//2, screen_radius//2)
-        highlight_radius = screen_radius//3
-        pygame.draw.circle(sphere_surface, (255, 255, 255, 100), 
-                         highlight_pos, highlight_radius)
-        
-        surface.blit(sphere_surface, (screen_x - screen_radius, screen_y - screen_radius))
+        # 绘制球体（缓存 sprite，避免每帧创建 Surface）
+        cache_key = (screen_radius, self.color)
+        sprite = _sphere_sprite_cache.get(cache_key)
+        if sprite is None:
+            sprite = pygame.Surface((screen_radius * 2, screen_radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(sprite, (*self.color, 180), (screen_radius, screen_radius), screen_radius)
+
+            # 添加高光
+            highlight_pos = (screen_radius // 2, screen_radius // 2)
+            highlight_radius = max(1, screen_radius // 3)
+            pygame.draw.circle(sprite, (255, 255, 255, 100), highlight_pos, highlight_radius)
+
+            # Keep cache from growing without bound
+            if len(_sphere_sprite_cache) > 256:
+                _sphere_sprite_cache.clear()
+            _sphere_sprite_cache[cache_key] = sprite
+
+        surface.blit(sprite, (screen_x - screen_radius, screen_y - screen_radius))
 
 # 隧道类
 class DreamTunnel:
@@ -294,28 +315,23 @@ class DreamTunnel:
             if z > 0:  # 只绘制在屏幕内的部分
                 scale = 500 / (z + 500)
                 radius = int(segment['radius'] * scale)
-                
-                # 绘制隧道环
-                tunnel_surface = pygame.Surface((radius*2, radius*2), pygame.SRCALPHA)
-                center = (radius, radius)
-                
-                # 绘制多个点形成环形
+
+                if radius <= 0:
+                    continue
+
+                # 绘制多个点形成环形（直接画到 layer，避免创建 tunnel_surface）
+                cx, cy = WIDTH // 2, HEIGHT // 2
                 points = []
                 for i in range(12):
                     angle = segment['rotation'] + i * math.pi / 6
-                    x = radius + math.cos(angle) * radius
-                    y = radius + math.sin(angle) * radius
+                    x = cx + math.cos(angle) * radius
+                    y = cy + math.sin(angle) * radius
                     points.append((x, y))
-                
-                # 连接点形成隧道环
+
                 for i in range(len(points)):
                     start = points[i]
                     end = points[(i + 1) % len(points)]
-                    pygame.draw.line(tunnel_surface, (*segment['color'], 150), 
-                                   start, end, 3)
-                
-                surface.blit(tunnel_surface, 
-                           (WIDTH//2 - radius, HEIGHT//2 - radius))
+                    pygame.draw.line(surface, (*segment['color'], 150), start, end, 3)
 
 # 创建各种3D元素
 cubes = [DreamCube() for _ in range(8)]
@@ -335,38 +351,41 @@ while running:
         elif event.type == pygame.MOUSEMOTION:
             mouse_x, mouse_y = event.pos
     
-    # 创建半透明背景，产生拖尾效果
-    overlay = pygame.Surface((WIDTH, HEIGHT))
-    overlay.set_alpha(20)
-    overlay.fill((0, 0, 0))
-    screen.blit(overlay, (0, 0))
+    # 复用半透明背景，产生拖尾效果
+    screen.blit(trail_overlay, (0, 0))
+
+    # Clear alpha drawing layer for this frame
+    alpha_layer.fill((0, 0, 0, 0))
     
     # 绘制隧道（作为背景）
     tunnel.update(mouse_x, mouse_y)
-    tunnel.draw(screen)
+    tunnel.draw(alpha_layer)
     
     # 更新和绘制所有3D元素
     for cube in cubes:
         cube.update(mouse_x, mouse_y)
-        cube.draw(screen)
+        cube.draw(alpha_layer)
     
     for building in buildings:
         building.update(mouse_x, mouse_y)
-        building.draw(screen)
+        building.draw(alpha_layer)
     
     for sphere in spheres:
         sphere.update(mouse_x, mouse_y)
-        sphere.draw(screen)
+        sphere.draw(alpha_layer)
     
     # 随机添加闪烁星星作为点缀
     if random.random() < 0.3:
         x = random.randint(0, WIDTH)
         y = random.randint(0, HEIGHT)
         size = random.randint(1, 2)
-        pygame.draw.circle(screen, (255, 255, 255), (x, y), size)
+        pygame.draw.circle(alpha_layer, (255, 255, 255, 255), (x, y), size)
     
     # 在鼠标位置绘制交互指示器
-    pygame.draw.circle(screen, (255, 255, 255, 100), (mouse_x, mouse_y), 10, 2)
+    pygame.draw.circle(alpha_layer, (255, 255, 255, 100), (mouse_x, mouse_y), 10, 2)
+
+    # Composite alpha layer onto screen once
+    screen.blit(alpha_layer, (0, 0))
     
     pygame.display.flip()
     clock.tick(60)
